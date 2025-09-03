@@ -1,0 +1,224 @@
+name: Microcap Weekly Email
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays 07:00 UTC (~09:00 Zurich summer / 08:00 winter)
+  workflow_dispatch:
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy pyyaml requests
+
+      - name: Generate report and email it
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          python - <<'PY'
+          import os, datetime, textwrap, smtplib, ssl, mimetypes, base64, json
+          from email.message import EmailMessage
+          from pathlib import Path
+          import pandas as pd, numpy as np, yfinance as yf, requests
+
+          # ----------- Config (tweak numbers if you like) -----------
+          EQUITY_USD = 100_000
+          MIN_PRICE = 1.0
+          MIN_MCAP = 50_000_000
+          MAX_MCAP = 500_000_000
+          ADV_DAYS = 20
+          MIN_ADV_USD = 200_000
+          ATR_WINDOW = 14
+          STOP_ATR_MULT = 2.0
+          ENTRY_ATR_BAND = 0.25          # ±0.25×ATR around last close
+          ADV_PARTICIPATION = 0.05        # max 5% of ADV/day
+          BASE_BPS = 10                   # slippage base
+          IMPACT_K = 30                   # bps per (trade$/ADV)
+          DD_KILL = 0.15                  # portfolio kill-switch (info only here)
+          # ----------------------------------------------------------
+
+          def load_candidates():
+              for p in [
+                  "Scripts and CSV Files/candidates.csv",
+                  "Start Your Own/candidates.csv",
+                  "data/candidates.csv",
+              ]:
+                  if os.path.exists(p):
+                      return pd.read_csv(p)
+              # fallback example list (replace with your own via candidates.csv)
+              tickers = ["TTOO","LIFW","GNS","SISI","VRAX","RELI","GBOX","HCDI","SPCB","JAGX"]
+              return pd.DataFrame({"ticker": tickers, "exchange": ["NASDAQ"]*len(tickers)})
+
+          def get_ohlcv(ticker, lookback_days=180):
+              end = datetime.date.today()
+              start = end - datetime.timedelta(days=lookback_days*2)
+              df = yf.download(ticker, start=start.isoformat(), end=(end+datetime.timedelta(days=1)).isoformat(),
+                               progress=False, auto_adjust=False)
+              if df is None or df.empty:
+                  return pd.DataFrame()
+              df = df.rename(columns=str.title)
+              return df
+
+          def atr(df, window=14):
+              if df.empty: return np.nan
+              h, l, c = df["High"], df["Low"], df["Close"]
+              tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+              v = tr.rolling(window).mean().iloc[-1]
+              return float(v) if pd.notna(v) else np.nan
+
+          def adv_dollar(df, window=20):
+              if df.empty: return 0.0
+              dv = (df["Close"]*df["Volume"]).tail(window).mean()
+              return float(dv) if pd.notna(dv) else 0.0
+
+          def get_meta(ticker):
+              try:
+                  info = {}
+                  try: info = yf.Ticker(ticker).info
+                  except Exception: pass
+                  return {
+                      "marketCap": info.get("marketCap"),
+                      "grossMargins": info.get("grossMargins"),
+                  }
+              except Exception:
+                  return {"marketCap": None, "grossMargins": None}
+
+          def filter_pass(t, exch):
+              df = get_ohlcv(t)
+              if df.empty: return None
+              price = float(df["Close"].iloc[-1])
+              if price < MIN_PRICE: return None
+              adv = adv_dollar(df, ADV_DAYS)
+              if adv < MIN_ADV_USD: return None
+              meta = get_meta(t)
+              mc = meta.get("marketCap")
+              if mc is not None and not (MIN_MCAP <= mc <= MAX_MCAP): return None
+              gm = meta.get("grossMargins")
+              if gm is not None and gm <= 0: return None  # simple quality flag
+              a = atr(df, ATR_WINDOW)
+              if not np.isfinite(a) or a <= 0: return None
+              return {"ticker": t, "exchange": exch, "price": price, "atr": a, "adv": adv}
+
+          def size_position(price, a, adv):
+              # per-position daily vol target derived from 3% annual ~ 0.03/sqrt(252)
+              daily_vol_target = 0.03 / (252**0.5)
+              target_position_value = EQUITY_USD * (daily_vol_target / max(1e-9, a/price))
+              # cap by ADV participation
+              max_trade_val = ADV_PARTICIPATION * adv
+              pos_val = min(target_position_value, max_trade_val)
+              shares = int(max(0, pos_val // price))
+              stop = price - STOP_ATR_MULT * a
+              entry_lo, entry_hi = price - ENTRY_ATR_BAND*a, price + ENTRY_ATR_BAND*a
+              risk_usd = shares * (price - stop)
+              trade_usd = shares * price
+              slip_bps = BASE_BPS + IMPACT_K * (trade_usd / adv if adv > 0 else 1.0)
+              return shares, entry_lo, entry_hi, stop, risk_usd, trade_usd, slip_bps
+
+          # Build plan
+          cand = load_candidates()
+          rows = []
+          for _, r in cand.iterrows():
+              t = str(r["ticker"]).upper()
+              exch = str(r.get("exchange","")).upper()
+              chk = filter_pass(t, exch)
+              if not chk: continue
+              shares, elo, ehi, stop, risk, trade, slip = size_position(chk["price"], chk["atr"], chk["adv"])
+              if shares <= 0: continue
+              rows.append({
+                  "ticker": t,
+                  "price": chk["price"],
+                  "atr": chk["atr"],
+                  "entry_lo": elo,
+                  "entry_hi": ehi,
+                  "stop": stop,
+                  "shares": shares,
+                  "trade_usd": trade,
+                  "risk_usd": risk,
+                  "est_slippage_bps": slip,
+              })
+
+          df = pd.DataFrame(rows).sort_values("ticker")
+          Path("reports").mkdir(parents=True, exist_ok=True)
+          today = datetime.date.today().isoformat()
+          outpath = f"reports/Weekly_Trades_{today}.md"
+
+          def md_table(df):
+              cols = ["ticker","price","atr","entry_lo","entry_hi","stop","shares","trade_usd","risk_usd","est_slippage_bps"]
+              lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"]*len(cols)) + " |"]
+              for _, r in df.iterrows():
+                  lines.append("| " + " | ".join([
+                      r["ticker"],
+                      f"{r['price']:.2f}",
+                      f"{r['atr']:.2f}",
+                      f"{r['entry_lo']:.2f}",
+                      f"{r['entry_hi']:.2f}",
+                      f"{r['stop']:.2f}",
+                      f"{int(r['shares'])}",
+                      f"{r['trade_usd']:.0f}",
+                      f"{r['risk_usd']:.0f}",
+                      f"{r['est_slippage_bps']:.1f}",
+                  ]) + " |")
+              return "\n".join(lines)
+
+          header = f"""# Weekly Trade Plan — {today}
+
+**Universe**: US micro-cap (NYSE/NASDAQ/AMEX), guardrails: price ≥ ${MIN_PRICE}, market cap ${MIN_MCAP:,}–${MAX_MCAP:,}, ADV ≥ ${MIN_ADV_USD:,}.  
+**Risk**: per-position vol target ~3% annualised; stop = {STOP_ATR_MULT}×ATR; portfolio kill-switch (info) at {int(DD_KILL*100)}% drawdown.  
+**Execution**: place **limit orders** inside ±{ENTRY_ATR_BAND}×ATR around last close; cap day-1 participation at **{int(ADV_PARTICIPATION*100)}% of ADV**; prefer **MOO** for exits on failed setups; expected slippage = base {BASE_BPS} bps + {IMPACT_K}·(trade$/ADV).
+
+## Planned Orders
+"""
+          with open(outpath, "w", encoding="utf-8") as f:
+              if df.empty:
+                  f.write(header + "\n_No names passed the guardrails this week._\n")
+              else:
+                  f.write(header + "\n" + md_table(df) + "\n\n---\n**Notes**: Quick news check (offerings/SPAC/going-concern) before entries. Slice orders to respect ADV cap.\n")
+
+          # Email the report via SendGrid (if configured)
+          api = os.getenv("SENDGRID_API_KEY")
+          frm = os.getenv("FROM_EMAIL")
+          to  = os.getenv("TO_EMAIL")
+          if api and frm and to:
+              with open(outpath, "rb") as f:
+                  content_b64 = base64.b64encode(f.read()).decode("utf-8")
+              payload = {
+                  "personalizations": [{"to": [{"email": to}]}],
+                  "from": {"email": frm},
+                  "subject": f"Micro-Cap Weekly Update — {today}",
+                  "content": [{"type": "text/plain", "value": f"Your weekly plan is attached: {outpath}"}],
+                  "attachments": [{
+                      "content": content_b64, "type": "text/markdown",
+                      "filename": outpath.split("/")[-1], "disposition": "attachment"
+                  }]
+              }
+              r = requests.post("https://api.sendgrid.com/v3/mail/send",
+                                headers={"Authorization": f"Bearer {api}", "Content-Type": "application/json"},
+                                json=payload)
+              if r.status_code >= 300:
+                  print("SendGrid error:", r.status_code, r.text)
+          else:
+              print("Email not sent (SendGrid secrets missing). The report file is created in /reports.")
+          PY
+
+      - name: Commit report to repo
+        run: |
+          if ls reports/Weekly_Trades_*.md 1> /dev/null 2>&1; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add reports/*.md
+            git commit -m "Weekly report [skip ci]" || echo "Nothing to commit"
+            git push
+          fi
